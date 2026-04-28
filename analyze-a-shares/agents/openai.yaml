@@ -1,0 +1,4 @@
+interface:
+  display_name: "Analyze A-Shares"
+  short_description: "Analyze China A-share equities"
+  default_prompt: "Use $analyze-a-shares to analyze 600519 with recent market, fundamentals, valuation, and risk context."
