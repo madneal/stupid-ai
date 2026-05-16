@@ -1,0 +1,4 @@
+interface:
+  display_name: "Lung Nodule DICOM"
+  short_description: "Analyze chest CT DICOM studies for pulmonary nodules"
+  default_prompt: "Use $lung-nodule-dicom to analyze a chest CT DICOM folder for pulmonary nodules and draft a Chinese report."
