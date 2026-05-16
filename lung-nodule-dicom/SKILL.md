@@ -1,22 +1,23 @@
 ---
 name: lung-nodule-dicom
-description: Analyze chest CT DICOM studies for pulmonary nodules when users provide DICOM files, CT series folders, LDCT screening studies, incidental lung nodules, or Chinese requests such as 肺结节诊断/肺部CT/胸部CT/DICOM分析. Use the bundled script to inspect DICOM pixels directly, generate lung-window/MIP review images, summarize CT acquisition metadata, draft a structured nodule report, and keep clinical recommendations framed as decision support requiring radiologist/doctor confirmation.
+description: Analyze chest CT DICOM studies for pulmonary nodules when users provide DICOM files, CT series folders, LDCT screening studies, incidental lung nodules, hospital report images, or Chinese requests such as 肺结节诊断/肺部CT/胸部CT/DICOM分析. Use the bundled script to inspect DICOM pixels directly, generate lung-window/MIP review images, summarize CT acquisition metadata, reconcile findings against transcribed hospital reports, draft a structured nodule report, and keep clinical recommendations framed as decision support requiring radiologist/doctor confirmation.
 ---
 
 # Lung Nodule DICOM
 
 ## Overview
 
-Use this skill to review chest CT DICOM data directly for pulmonary nodule decision support. It can parse DICOM series, create lung-window review images, extract acquisition parameters, generate rough candidate nodule crops, and draft a bilingual clinical-style report.
+Use this skill to review chest CT DICOM data directly for pulmonary nodule decision support. It can parse DICOM series, create lung-window review images, extract acquisition parameters, generate rough candidate nodule crops, reconcile against a hospital radiology report, and draft a bilingual clinical-style report.
 
 This skill is not a medical device and must not present automated image findings as a definitive diagnosis. For patient-specific management, state uncertainty, cite current guidelines when used, and recommend confirmation by a qualified radiologist or treating physician.
 
-For clinical workflow details, reporting language, and guideline caveats, read [references/clinical_framework.md](references/clinical_framework.md).
+For clinical workflow details, reporting language, and guideline caveats, read [references/clinical_framework.md](references/clinical_framework.md). For hospital report images or disagreement analysis, read [references/hospital_report_reconciliation.md](references/hospital_report_reconciliation.md).
 
 ## Workflow
 
 1. Confirm the study context.
    - Ask for missing clinical context only when it changes interpretation: age, smoking history, cancer history, symptoms, immunosuppression, CT date, screening versus incidental study, and prior CT availability.
+   - If hospital report images are provided, inspect the images first and extract only clinically relevant report text. Redact patient name, ID, accession number, phone, address, and hospital identifiers unless the user explicitly needs them.
    - Treat the task as decision support, not a final diagnosis.
    - Avoid exposing patient identifiers unless the user explicitly needs them.
 
@@ -25,6 +26,20 @@ For clinical workflow details, reporting language, and guideline caveats, read [
 ```bash
 python3 scripts/analyze_lung_ct_dicom.py /path/to/dicom-or-folder --out ./lung_ct_review
 ```
+
+   If the hospital report was provided as images, transcribe the nodule-related findings into a local text or JSON file, then pass it into the analyzer:
+
+```bash
+python3 scripts/analyze_lung_ct_dicom.py /path/to/dicom-or-folder --out ./lung_ct_review --hospital-report-text ./hospital_report_text.md
+```
+
+   Optional OCR can bootstrap local image files, but verify OCR against the report image before relying on it:
+
+```bash
+python3 scripts/analyze_lung_ct_dicom.py /path/to/dicom-or-folder --out ./lung_ct_review --hospital-report-image ./report_page1.png
+```
+
+   Local OCR requires `pytesseract` plus the Tesseract system binary. If OCR is unavailable or noisy, use direct image review and manually create the transcribed text/JSON.
 
    If dependencies are missing:
 
@@ -39,6 +54,8 @@ python3 -m pip install -r scripts/requirements.txt
    - `series_*_contact_sheet_lung.png`: lung-window axial review sheet.
    - `series_*_mip_lung.png`: thin-slab maximum-intensity projections for nodule search support.
    - `candidates.csv` and `candidate_*.png`: rough automated candidates when the optional SciPy-based detector can run.
+   - `hospital_report_findings.json`: redacted findings extracted from the hospital report when report input is provided.
+   - `report_reconciliation.md`: line-by-line comparison between hospital report findings and AI candidate evidence.
    - `report_draft.md`: starting point for a structured report.
 
 4. Validate the selected CT series before interpretation.
@@ -53,6 +70,7 @@ python3 -m pip install -r scripts/requirements.txt
 
 6. Draft the answer.
    - Start with the technical adequacy and the most clinically relevant findings.
+   - If a hospital report is provided, state that the hospital radiology report is the primary clinical source. Present AI differences as possible questions for radiologist review, not competing diagnoses.
    - Separate observed image facts from inference and guideline-based follow-up.
    - Use Chinese if the user asked in Chinese.
    - Include a safety line: this is AI-assisted review and should be confirmed by a radiologist/doctor, especially for management decisions.
@@ -73,6 +91,12 @@ python3 scripts/analyze_lung_ct_dicom.py ./DICOM --no-candidates --out ./review
 
 # Limit memory on large studies
 python3 scripts/analyze_lung_ct_dicom.py ./DICOM --max-slices 450 --out ./review
+
+# Reconcile DICOM findings with a manually transcribed hospital report
+python3 scripts/analyze_lung_ct_dicom.py ./DICOM --hospital-report-text ./hospital_report_text.md --out ./review
+
+# Use structured report findings extracted from report images
+python3 scripts/analyze_lung_ct_dicom.py ./DICOM --hospital-report-json ./hospital_report_findings.json --out ./review
 ```
 
 The detector is intentionally conservative and unvalidated. It helps find soft-tissue-density objects inside a rough lung mask, but it cannot classify malignancy, reliably separate vessels/scars from nodules, or exclude subtle ground-glass nodules.

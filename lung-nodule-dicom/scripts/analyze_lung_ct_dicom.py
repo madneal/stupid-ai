@@ -12,6 +12,7 @@ import csv
 import hashlib
 import json
 import math
+import re
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -53,6 +54,21 @@ class Candidate:
     max_hu: float
     bbox_px: list[int]
     crop_file: str
+    note: str
+
+
+@dataclass
+class HospitalReportFinding:
+    finding_id: int
+    source_text: str
+    location: str
+    nodule_type: str
+    size_text: str
+    dimensions_mm: list[float]
+    max_diameter_mm: float | None
+    change: str
+    recommendation: str
+    reported_absent: bool
     note: str
 
 
@@ -136,6 +152,326 @@ def dicom_text(value: Any) -> str:
     if isinstance(value, (list, tuple)):
         return "\\".join(str(v) for v in value)
     return str(value)
+
+
+def redact_phi_text(text: str) -> str:
+    replacements = [
+        r"(姓名|患者姓名|病人姓名|name)\s*[:：]\s*[^\s，,；;]+",
+        r"(性别|sex)\s*[:：]\s*[^\s，,；;]+",
+        r"(年龄|age)\s*[:：]\s*[^\s，,；;]+",
+        r"(住院号|门诊号|检查号|影像号|病历号|登记号|accession|patient\s*id|id)\s*[:：]\s*[A-Za-z0-9_.-]+",
+        r"(电话|手机号|mobile|phone)\s*[:：]\s*[0-9+\-() ]{6,}",
+        r"(身份证号|身份证|证件号)\s*[:：]\s*[0-9Xx*]{8,}",
+    ]
+    redacted = text
+    for pattern in replacements:
+        redacted = re.sub(pattern, r"\1: [REDACTED]", redacted, flags=re.IGNORECASE)
+    return redacted
+
+
+def split_report_lines(text: str) -> list[str]:
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    chunks: list[str] = []
+    for line in normalized.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = re.split(r"(?<=[。；;])\s*|\s{2,}", line)
+        chunks.extend(part.strip() for part in parts if part.strip())
+    return chunks
+
+
+def convert_report_measurement(value: str, unit: str | None) -> float:
+    number = float(value)
+    unit_text = (unit or "mm").lower()
+    if unit_text in {"cm", "厘米"}:
+        return number * 10.0
+    return number
+
+
+def extract_report_dimensions(text: str) -> tuple[str, list[float]]:
+    dimensions: list[float] = []
+    size_texts: list[str] = []
+    multi_pattern = re.compile(
+        r"(\d+(?:\.\d+)?)\s*(?:x|X|×|\*)\s*"
+        r"(\d+(?:\.\d+)?)(?:\s*(?:x|X|×|\*)\s*(\d+(?:\.\d+)?))?"
+        r"\s*(mm|毫米|cm|厘米)?",
+        re.IGNORECASE,
+    )
+    spans: list[tuple[int, int]] = []
+    for match in multi_pattern.finditer(text):
+        unit = match.group(4)
+        values = [
+            convert_report_measurement(group, unit)
+            for group in match.groups()[:3]
+            if group is not None
+        ]
+        if values:
+            dimensions.extend(values)
+            size_texts.append(match.group(0))
+            spans.append(match.span())
+
+    single_pattern = re.compile(r"(\d+(?:\.\d+)?)\s*(mm|毫米|cm|厘米)", re.IGNORECASE)
+    for match in single_pattern.finditer(text):
+        if any(start <= match.start() < end for start, end in spans):
+            continue
+        dimensions.append(convert_report_measurement(match.group(1), match.group(2)))
+        size_texts.append(match.group(0))
+
+    return "; ".join(size_texts), dimensions
+
+
+def extract_report_location(text: str) -> str:
+    patterns = [
+        "右肺上叶",
+        "右肺中叶",
+        "右肺下叶",
+        "左肺上叶",
+        "左肺下叶",
+        "右上肺",
+        "右中肺",
+        "右下肺",
+        "左上肺",
+        "左下肺",
+        "两肺",
+        "双肺",
+        "胸膜下",
+        "叶间裂",
+        "right upper lobe",
+        "right middle lobe",
+        "right lower lobe",
+        "left upper lobe",
+        "left lower lobe",
+        "bilateral",
+        "subpleural",
+        "fissure",
+    ]
+    lower = text.lower()
+    found: list[str] = []
+    for pattern in patterns:
+        if pattern in text or pattern in lower:
+            found.append(pattern)
+    return ", ".join(dict.fromkeys(found))
+
+
+def extract_report_nodule_type(text: str) -> str:
+    lower = text.lower()
+    if any(term in text for term in ("部分实性", "混合磨玻璃", "亚实性")) or any(
+        term in lower for term in ("part-solid", "part solid", "subsolid")
+    ):
+        return "part-solid/subsolid"
+    if "磨玻璃" in text or any(
+        term in lower for term in ("ground-glass", "ground glass", "ggo")
+    ):
+        return "ground-glass"
+    if "实性" in text or "solid" in lower:
+        return "solid"
+    if "钙化" in text or "calcified" in lower:
+        return "calcified"
+    if "结节" in text or "nodule" in lower:
+        return "nodule"
+    return ""
+
+
+def extract_report_change(text: str) -> str:
+    lower = text.lower()
+    if any(term in text for term in ("新发", "新增")) or "new" in lower:
+        return "new"
+    if any(term in text for term in ("增大", "增长", "进展")) or any(
+        term in lower for term in ("increased", "growth", "enlarged")
+    ):
+        return "increased"
+    if any(term in text for term in ("缩小", "吸收", "减少")) or any(
+        term in lower for term in ("decreased", "smaller", "resolved")
+    ):
+        return "decreased/resolving"
+    if any(term in text for term in ("稳定", "无明显变化", "同前")) or any(
+        term in lower for term in ("stable", "unchanged")
+    ):
+        return "stable"
+    return ""
+
+
+def extract_report_recommendation(text: str) -> str:
+    if any(term in text for term in ("建议", "随访", "复查", "复诊")):
+        return text
+    lower = text.lower()
+    if any(term in lower for term in ("recommend", "follow-up", "follow up", "repeat ct")):
+        return text
+    return ""
+
+
+def is_report_absence_statement(text: str) -> bool:
+    lower = text.lower()
+    chinese_absent = re.search(r"(未见|没有|无)(明显)?[^。；;\n]{0,12}(结节|占位|肿块)", text)
+    english_absent = re.search(r"\b(no|without)\b.{0,24}\b(nodule|mass)\b", lower)
+    return bool(chinese_absent or english_absent)
+
+
+def looks_like_report_nodule_line(text: str) -> bool:
+    lower = text.lower()
+    terms = (
+        "结节",
+        "磨玻璃",
+        "实性",
+        "占位",
+        "肿块",
+        "ggo",
+        "ground-glass",
+        "ground glass",
+        "nodule",
+        "mass",
+    )
+    return any(term in text or term in lower for term in terms)
+
+
+def parse_hospital_report_text(text: str) -> list[HospitalReportFinding]:
+    findings: list[HospitalReportFinding] = []
+    for line in split_report_lines(redact_phi_text(text)):
+        if not looks_like_report_nodule_line(line):
+            continue
+        size_text, dimensions = extract_report_dimensions(line)
+        reported_absent = is_report_absence_statement(line)
+        nodule_type = "absence statement" if reported_absent else extract_report_nodule_type(line)
+        findings.append(
+            HospitalReportFinding(
+                finding_id=len(findings) + 1,
+                source_text=line,
+                location=extract_report_location(line),
+                nodule_type=nodule_type,
+                size_text=size_text,
+                dimensions_mm=dimensions,
+                max_diameter_mm=max(dimensions) if dimensions else None,
+                change=extract_report_change(line),
+                recommendation=extract_report_recommendation(line),
+                reported_absent=reported_absent,
+                note="Extracted from hospital report text; verify against the original report image.",
+            )
+        )
+    return findings
+
+
+def finding_from_json(item: dict[str, Any], finding_id: int) -> HospitalReportFinding:
+    raw_dimensions = item.get("dimensions_mm") or item.get("size_mm") or []
+    if isinstance(raw_dimensions, (int, float, str)):
+        raw_dimensions = [raw_dimensions]
+    dimensions: list[float] = []
+    for value in raw_dimensions:
+        try:
+            dimensions.append(float(value))
+        except Exception:
+            continue
+    source_text = redact_phi_text(str(item.get("source_text") or item.get("text") or ""))
+    return HospitalReportFinding(
+        finding_id=finding_id,
+        source_text=source_text,
+        location=str(item.get("location") or ""),
+        nodule_type=str(item.get("nodule_type") or item.get("type") or ""),
+        size_text=str(item.get("size_text") or ""),
+        dimensions_mm=dimensions,
+        max_diameter_mm=(
+            float(item["max_diameter_mm"])
+            if item.get("max_diameter_mm") is not None
+            else (max(dimensions) if dimensions else None)
+        ),
+        change=str(item.get("change") or ""),
+        recommendation=str(item.get("recommendation") or ""),
+        reported_absent=bool(item.get("reported_absent", False)),
+        note=str(
+            item.get("note")
+            or "Structured hospital report finding; verify against the original report image."
+        ),
+    )
+
+
+def load_hospital_report_json(path: Path) -> tuple[list[HospitalReportFinding], str]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    report_text = ""
+    findings: list[HospitalReportFinding] = []
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict):
+                findings.append(finding_from_json(item, len(findings) + 1))
+    elif isinstance(data, dict):
+        report_text = str(data.get("report_text") or data.get("text") or "")
+        raw_findings = data.get("findings") or []
+        if isinstance(raw_findings, list):
+            for item in raw_findings:
+                if isinstance(item, dict):
+                    findings.append(finding_from_json(item, len(findings) + 1))
+    else:
+        die(f"unsupported hospital report JSON shape: {path}")
+    return findings, report_text
+
+
+def ocr_hospital_report_images(
+    image_paths: list[Path], language: str, warnings: list[str]
+) -> str:
+    if not image_paths:
+        return ""
+    try:
+        import pytesseract  # type: ignore
+        from PIL import Image  # type: ignore
+    except Exception:
+        warnings.append(
+            "Hospital report images were provided, but pytesseract/Pillow OCR is "
+            "unavailable. Use model vision to transcribe the report into text or JSON."
+        )
+        return ""
+
+    chunks: list[str] = []
+    for path in image_paths:
+        if not path.exists():
+            warnings.append(f"Hospital report image does not exist: {path}")
+            continue
+        try:
+            text = pytesseract.image_to_string(Image.open(path), lang=language)
+        except Exception as exc:
+            warnings.append(f"OCR failed for hospital report image {path.name}: {exc}")
+            continue
+        chunks.append(f"[OCR source: {path.name}]\n{text.strip()}")
+    if chunks:
+        warnings.append(
+            "Hospital report OCR was used. Verify extracted findings against the "
+            "original report image before making clinical comparisons."
+        )
+    return "\n\n".join(chunks)
+
+
+def load_hospital_report_inputs(
+    args: argparse.Namespace, warnings: list[str]
+) -> tuple[list[HospitalReportFinding], bool]:
+    requested = bool(
+        args.hospital_report_text
+        or args.hospital_report_json
+        or args.hospital_report_image
+    )
+    findings: list[HospitalReportFinding] = []
+    report_text_parts: list[str] = []
+
+    if args.hospital_report_json:
+        json_findings, json_text = load_hospital_report_json(args.hospital_report_json)
+        findings.extend(json_findings)
+        if json_text and not json_findings:
+            report_text_parts.append(json_text)
+
+    if args.hospital_report_text:
+        report_text_parts.append(args.hospital_report_text.read_text(encoding="utf-8"))
+
+    if args.hospital_report_image:
+        report_text_parts.append(
+            ocr_hospital_report_images(
+                args.hospital_report_image, args.ocr_language, warnings
+            )
+        )
+
+    if report_text_parts:
+        parsed = parse_hospital_report_text("\n\n".join(report_text_parts))
+        findings.extend(parsed)
+
+    for index, finding in enumerate(findings, start=1):
+        finding.finding_id = index
+    return findings, requested
 
 
 def uid_for_output(uid: str, include_phi: bool) -> str:
@@ -655,6 +991,154 @@ def write_candidates_csv(path: Path, candidates: list[Candidate]) -> None:
             writer.writerow(row)
 
 
+def write_hospital_report_findings_json(
+    path: Path, findings: list[HospitalReportFinding]
+) -> None:
+    path.write_text(
+        json.dumps(
+            [asdict(finding) for finding in findings],
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+def choose_candidate_match(
+    finding: HospitalReportFinding, candidates: list[Candidate]
+) -> tuple[Candidate | None, str]:
+    if not candidates:
+        return None, "No automated DICOM candidates were generated."
+    if finding.reported_absent:
+        return None, "Hospital report states no relevant nodule/mass finding."
+    if finding.max_diameter_mm is None:
+        return None, "Report finding has no extracted size for candidate matching."
+
+    best = min(
+        candidates,
+        key=lambda candidate: abs(
+            candidate.equivalent_diameter_mm - float(finding.max_diameter_mm)
+        ),
+    )
+    difference = abs(best.equivalent_diameter_mm - float(finding.max_diameter_mm))
+    tolerance = max(3.0, float(finding.max_diameter_mm) * 0.5)
+    if difference <= tolerance:
+        return (
+            best,
+            "Possible size match only; confirm location and slice manually.",
+        )
+    return best, "Nearest candidate is not a reliable size match; manual review needed."
+
+
+def write_report_reconciliation(
+    path: Path,
+    selected: dict[str, Any],
+    candidates: list[Candidate],
+    report_findings: list[HospitalReportFinding],
+    warnings: list[str],
+) -> None:
+    lines: list[str] = []
+    lines.append("# Hospital Report Reconciliation")
+    lines.append("")
+    lines.append(
+        "This comparison treats the hospital radiology report as the primary clinical "
+        "source. AI candidates are search aids, not confirmed nodules."
+    )
+    lines.append("")
+    lines.append("## Inputs")
+    lines.append(f"- Selected DICOM series: {selected.get('description') or '[unlabeled]'}")
+    lines.append(f"- Slice thickness: {selected.get('slice_thickness_mm') or '[unknown]'} mm")
+    lines.append(f"- Automated candidate count: {len(candidates)}")
+    lines.append(f"- Extracted hospital report finding count: {len(report_findings)}")
+    lines.append("")
+
+    if warnings:
+        lines.append("## Warnings")
+        for warning in warnings:
+            lines.append(f"- {warning}")
+        lines.append("")
+
+    lines.append("## Finding-Level Comparison")
+    lines.append(
+        "| Report finding | Report location/type/size | AI candidate | Assessment |"
+    )
+    lines.append("|---|---|---|---|")
+    if report_findings:
+        for finding in report_findings:
+            candidate, assessment = choose_candidate_match(finding, candidates)
+            report_summary = "<br>".join(
+                part
+                for part in (
+                    f"location: {finding.location}" if finding.location else "",
+                    f"type: {finding.nodule_type}" if finding.nodule_type else "",
+                    f"size: {finding.size_text}" if finding.size_text else "",
+                    f"change: {finding.change}" if finding.change else "",
+                )
+                if part
+            )
+            if not report_summary:
+                report_summary = "[not extracted]"
+            if candidate is None:
+                candidate_summary = "-"
+            else:
+                candidate_summary = (
+                    f"C{candidate.candidate_id} slice #{candidate.slice_index}, "
+                    f"{candidate.equivalent_diameter_mm:.1f} mm, "
+                    f"{candidate.crop_file or '[no crop]'}"
+                )
+            source = finding.source_text.replace("|", "/")
+            lines.append(
+                f"| {source} | {report_summary} | {candidate_summary} | {assessment} |"
+            )
+    else:
+        lines.append(
+            "| No report nodule finding extracted | - | - | "
+            "Transcribe the report image manually or provide structured JSON. |"
+        )
+    lines.append("")
+
+    if candidates:
+        lines.append("## AI-Only Candidate Review Queue")
+        lines.append(
+            "These candidates may be vessels, scars, airway walls, inflammation, or "
+            "partial-volume artifacts. Review them only as possible explanations for "
+            "differences from the hospital report."
+        )
+        lines.append("")
+        lines.append("| Candidate | Slice | Diameter | Mean HU | Crop |")
+        lines.append("|---:|---:|---:|---:|---|")
+        for candidate in sorted(
+            candidates,
+            key=lambda item: item.equivalent_diameter_mm,
+            reverse=True,
+        )[:12]:
+            lines.append(
+                "| C{cid} | #{sl} | {diam:.1f} mm | {hu:.0f} | {crop} |".format(
+                    cid=candidate.candidate_id,
+                    sl=candidate.slice_index,
+                    diam=candidate.equivalent_diameter_mm,
+                    hu=candidate.mean_hu,
+                    crop=candidate.crop_file or "",
+                )
+            )
+        lines.append("")
+
+    lines.append("## Reconciliation Guidance")
+    lines.append(
+        "- If the hospital report describes a finding that AI did not match, inspect "
+        "the original thin-section lung-window DICOM at the reported lobe/location."
+    )
+    lines.append(
+        "- If AI candidates are not mentioned in the hospital report, assume false "
+        "positive candidates until a radiologist confirms otherwise."
+    )
+    lines.append(
+        "- For management decisions, use the formal radiology report and treating "
+        "doctor/radiologist interpretation."
+    )
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def write_report_draft(
     path: Path,
     selected: dict[str, Any],
@@ -732,6 +1216,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--candidate-min-hu", type=float, default=-500.0)
     parser.add_argument("--candidate-max-hu", type=float, default=300.0)
     parser.add_argument("--max-candidates", type=int, default=30)
+    parser.add_argument(
+        "--hospital-report-text",
+        type=Path,
+        help="Transcribed hospital report text. PHI is redacted from derived outputs.",
+    )
+    parser.add_argument(
+        "--hospital-report-json",
+        type=Path,
+        help="Structured report findings JSON, or JSON containing report_text/findings.",
+    )
+    parser.add_argument(
+        "--hospital-report-image",
+        action="append",
+        type=Path,
+        default=[],
+        help="Hospital report image for optional OCR. Prefer verified transcription.",
+    )
+    parser.add_argument(
+        "--ocr-language",
+        default="chi_sim+eng",
+        help="Tesseract language string for --hospital-report-image OCR.",
+    )
     return parser
 
 
@@ -786,6 +1292,21 @@ def main() -> int:
         save_candidate_crops(np, Image, ImageDraw, volume, candidates, args.out)
         write_candidates_csv(args.out / "candidates.csv", candidates)
 
+    hospital_report_findings, hospital_report_input_requested = load_hospital_report_inputs(
+        args, warnings
+    )
+    if hospital_report_input_requested:
+        write_hospital_report_findings_json(
+            args.out / "hospital_report_findings.json", hospital_report_findings
+        )
+        write_report_reconciliation(
+            args.out / "report_reconciliation.md",
+            selected,
+            candidates,
+            hospital_report_findings,
+            warnings,
+        )
+
     summary_json = {
         "selected_series_uid": selected_uid_display,
         "selected_series": {
@@ -803,12 +1324,32 @@ def main() -> int:
             "contact_sheet_lung": contact_path.name,
             "mip_lung": mip_path.name,
             "candidates_csv": "candidates.csv" if not args.no_candidates else None,
+            "hospital_report_findings_json": (
+                "hospital_report_findings.json"
+                if hospital_report_input_requested
+                else None
+            ),
+            "report_reconciliation": (
+                "report_reconciliation.md" if hospital_report_input_requested else None
+            ),
         },
         "candidate_count": len(candidates),
+        "hospital_report": {
+            "input_provided": hospital_report_input_requested,
+            "finding_count": len(hospital_report_findings),
+            "note": (
+                "Hospital report findings are extracted/redacted for reconciliation; "
+                "verify OCR or manual transcription against the original report image."
+            ),
+        },
         "warnings": warnings,
         "privacy": {
             "include_phi": bool(args.include_phi),
-            "note": "UIDs and patient identifiers are redacted or hashed unless --include-phi is used.",
+            "note": (
+                "UIDs and patient identifiers are redacted or hashed unless "
+                "--include-phi is used. Hospital report PHI patterns are redacted "
+                "from derived reconciliation artifacts."
+            ),
         },
     }
     (args.out / "study_summary.json").write_text(

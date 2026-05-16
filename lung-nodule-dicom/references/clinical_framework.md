@@ -28,6 +28,7 @@ Ask for or note whether these are unknown:
 4. Check mediastinal window when available for calcification, fat, lymph nodes, pleural effusion, or chest-wall invasion.
 5. Confirm automated candidates manually. Ignore candidates explained by vessels, fissures, airway walls, scars, atelectasis, motion, or partial volume.
 6. Compare with prior CT. Document stability, growth, new nodules, and resolving inflammatory findings.
+7. If a hospital report is provided, reconcile against the report rather than treating AI candidates as competing findings.
 
 ## Nodule Description Checklist
 
@@ -85,6 +86,16 @@ Avoid overcalling:
 - Infection/inflammation, especially transient ground-glass opacity
 - Mucus plugging or airway wall thickening
 - Motion artifact and partial-volume effects
+
+## Hospital Report Reconciliation
+
+The formal hospital radiology report is the primary clinical interpretation. When AI output differs, frame the AI result as a possible review question:
+
+- "AI未可靠匹配到报告所述结节" rather than "报告错误"
+- "AI候选灶可能为血管/瘢痕/气道壁，需人工确认" rather than "新增结节"
+- "请放射科医生结合原始薄层DICOM复核" for any management-relevant discrepancy
+
+For report images, extract only relevant report findings and redact PHI before generating reconciliation artifacts.
 
 ## Report Drafting
 
