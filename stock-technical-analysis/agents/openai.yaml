@@ -1,0 +1,4 @@
+interface:
+  display_name: "Stock Technical Analysis"
+  short_description: "Screen A-shares and ETFs with technical indicators"
+  default_prompt: "Use $stock-technical-analysis to rank this stock watchlist by technical trend, buy zones, and stop levels."
